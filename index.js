@@ -535,4 +535,23 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
+// ─── Keep-alive HTTP server (for free hosting on Render) ───
+const http = require("http");
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "online",
+        bot: client.user?.tag || "starting...",
+        uptime: Math.floor(process.uptime()),
+      })
+    );
+  })
+  .listen(PORT, () => {
+    console.log(`Keep-alive server running on port ${PORT}`);
+  });
+
 client.login(process.env.DISCORD_TOKEN);
