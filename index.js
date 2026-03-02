@@ -174,11 +174,19 @@ server.listen(PORT, () => {
 // ─── Discord Bot ───
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers],
 });
 
 client.once("ready", () => {
   console.log(`Logged in as ${client.user.tag}`);
+});
+
+client.on("error", (err) => {
+  console.error("Discord client error:", err.message);
+});
+
+client.on("warn", (msg) => {
+  console.warn("Discord warning:", msg);
 });
 
 client.on("interactionCreate", async (interaction) => {
@@ -483,6 +491,9 @@ if (!token) {
   console.log(`Token loaded (${token.length} chars, starts with ${token.slice(0, 10)}...)`);
 }
 
-client.login(token).catch((err) => {
+console.log("Attempting Discord login...");
+client.login(token).then(() => {
+  console.log("Discord login succeeded!");
+}).catch((err) => {
   console.error("DISCORD LOGIN FAILED:", err.message);
 });
