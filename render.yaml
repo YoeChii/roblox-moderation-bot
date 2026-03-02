@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: roblox-moderation-bot
+    runtime: node
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: ROBLOX_API_KEY
+        sync: false
+      - key: UNIVERSE_ID
+        sync: false

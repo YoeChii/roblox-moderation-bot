@@ -1,0 +1,14 @@
+{
+  "name": "roblox-moderation-bot",
+  "version": "1.0.0",
+  "description": "Discord bot for moderating Roblox players via Open Cloud API",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "deploy": "node deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.7"
+  }
+}
