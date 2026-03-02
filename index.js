@@ -475,4 +475,14 @@ client.on("interactionCreate", async (interaction) => {
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+// ─── Login with error handling ───
+const token = process.env.DISCORD_TOKEN;
+if (!token) {
+  console.error("ERROR: DISCORD_TOKEN environment variable is not set!");
+} else {
+  console.log(`Token loaded (${token.length} chars, starts with ${token.slice(0, 10)}...)`);
+}
+
+client.login(token).catch((err) => {
+  console.error("DISCORD LOGIN FAILED:", err.message);
+});
