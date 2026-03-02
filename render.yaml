@@ -12,7 +12,5 @@ services:
         sync: false
       - key: GUILD_ID
         sync: false
-      - key: ROBLOX_API_KEY
-        sync: false
-      - key: UNIVERSE_ID
+      - key: POLL_SECRET
         sync: false

@@ -1,8 +1,14 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════
- *  Roblox Moderation Bot — Discord → Roblox Open Cloud
+ *  Roblox Moderation Bot — Discord → Roblox (No API Key Needed)
  *  Kick/Ban/Unban players directly from Discord
  * ═══════════════════════════════════════════════════════════════════════
+ *
+ *  How it works:
+ *    - Discord slash commands queue moderation actions on this bot
+ *    - The Roblox game polls this bot every 5 seconds via HttpService
+ *    - Roblox picks up commands, kicks/bans players, stores bans in DataStore
+ *    - No Roblox Open Cloud API key required!
  *
  *  Setup:
  *    1. Copy .env.example → .env and fill in your tokens
@@ -11,13 +17,14 @@
  *    4. node index.js             (run the bot)
  *
  *  Commands:
- *    /kick  <username> <reason>
- *    /ban   <username> <duration> <reason>
- *    /unban <username>
- *    /baninfo <username>
+ *    /kick     <username> <reason>
+ *    /ban      <username> <duration> <reason>
+ *    /unban    <username>
+ *    /baninfo  <username>
  */
 
 require("dotenv").config();
+const http = require("http");
 const {
   Client,
   GatewayIntentBits,
@@ -26,35 +33,46 @@ const {
 } = require("discord.js");
 
 // ─── Config ───
-const UNIVERSE_ID = process.env.UNIVERSE_ID;
-const API_KEY = process.env.ROBLOX_API_KEY;
-const DATASTORE_NAME = "DiscordBans";
-const MESSAGING_TOPIC = "DiscordModeration";
+const POLL_SECRET = process.env.POLL_SECRET || "changeme";
+const PORT = process.env.PORT || 3000;
+
+// ─── Command Queue ───
+// All game servers poll this queue. Commands stay for 60s so every server sees them.
+const commandQueue = [];
+let commandIdCounter = 0;
+
+function queueCommand(cmd) {
+  commandIdCounter++;
+  cmd.id = commandIdCounter;
+  cmd.timestamp = Date.now();
+  commandQueue.push(cmd);
+}
+
+// Cleanup commands older than 60 seconds
+setInterval(() => {
+  const cutoff = Date.now() - 60000;
+  while (commandQueue.length > 0 && commandQueue[0].timestamp < cutoff) {
+    commandQueue.shift();
+  }
+}, 10000);
+
+// ─── Ban record cache (in-memory, for /baninfo) ───
+const banCache = new Map(); // userId -> banData
 
 // ─── Roblox API helpers ───
 
-/**
- * Resolve a Roblox username (or raw userId string) → { userId, username }
- */
 async function resolvePlayer(input) {
-  // If input is a number, treat as userId
   if (/^\d+$/.test(input)) {
-    const res = await fetch(
-      `https://users.roblox.com/v1/users/${input}`
-    );
+    const res = await fetch(`https://users.roblox.com/v1/users/${input}`);
     if (!res.ok) return null;
     const data = await res.json();
     return { userId: data.id, username: data.name };
   }
 
-  // Otherwise resolve username
   const res = await fetch("https://users.roblox.com/v1/usernames/users", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      usernames: [input],
-      excludeBannedUsers: false,
-    }),
+    body: JSON.stringify({ usernames: [input], excludeBannedUsers: false }),
   });
   if (!res.ok) return null;
   const data = await res.json();
@@ -62,9 +80,6 @@ async function resolvePlayer(input) {
   return { userId: data.data[0].id, username: data.data[0].name };
 }
 
-/**
- * Get a player's avatar thumbnail URL
- */
 async function getAvatarUrl(userId) {
   try {
     const res = await fetch(
@@ -78,111 +93,83 @@ async function getAvatarUrl(userId) {
   }
 }
 
-/**
- * Publish a message to all game servers via MessagingService Open Cloud API
- */
-async function publishMessage(payload) {
-  const url = `https://apis.roblox.com/messaging-service/v1/universes/${UNIVERSE_ID}/topics/${MESSAGING_TOPIC}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "x-api-key": API_KEY,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({ message: JSON.stringify(payload) }),
-  });
-  return res.ok;
-}
-
-/**
- * Write a ban entry to DataStore via Open Cloud API
- */
-async function writeBan(userId, banData) {
-  const url =
-    `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}` +
-    `/standard-datastores/datastore/entries/entry` +
-    `?datastoreName=${DATASTORE_NAME}&entryKey=${userId}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "x-api-key": API_KEY,
-      "Content-Type": "application/json",
-      "roblox-entry-attributes": "{}",
-      "roblox-entry-userids": `[${userId}]`,
-    },
-    body: JSON.stringify(banData),
-  });
-  return res.ok;
-}
-
-/**
- * Read a ban entry from DataStore
- */
-async function readBan(userId) {
-  const url =
-    `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}` +
-    `/standard-datastores/datastore/entries/entry` +
-    `?datastoreName=${DATASTORE_NAME}&entryKey=${userId}`;
-  const res = await fetch(url, {
-    method: "GET",
-    headers: { "x-api-key": API_KEY },
-  });
-  if (!res.ok) return null;
-  return await res.json();
-}
-
-/**
- * Delete a ban entry from DataStore
- */
-async function deleteBan(userId) {
-  const url =
-    `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}` +
-    `/standard-datastores/datastore/entries/entry` +
-    `?datastoreName=${DATASTORE_NAME}&entryKey=${userId}`;
-  const res = await fetch(url, {
-    method: "DELETE",
-    headers: { "x-api-key": API_KEY },
-  });
-  return res.ok;
-}
-
 // ─── Duration parsing ───
 
-/**
- * Parse duration string → seconds (or -1 for permanent)
- * Supports: 30m, 2h, 7d, 30d, perm/permanent
- */
 function parseDuration(input) {
   const lower = input.toLowerCase().trim();
   if (lower === "perm" || lower === "permanent") return -1;
-
   const match = lower.match(/^(\d+)(m|h|d)$/);
   if (!match) return null;
-
   const num = parseInt(match[1]);
-  const unit = match[2];
-
-  switch (unit) {
-    case "m":
-      return num * 60;
-    case "h":
-      return num * 3600;
-    case "d":
-      return num * 86400;
-    default:
-      return null;
+  switch (match[2]) {
+    case "m": return num * 60;
+    case "h": return num * 3600;
+    case "d": return num * 86400;
+    default: return null;
   }
 }
 
-/**
- * Format seconds into human-readable duration
- */
 function formatDuration(seconds) {
   if (seconds === -1) return "Permanent";
   if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours`;
   return `${Math.floor(seconds / 86400)} days`;
 }
+
+// ─── HTTP Server (keep-alive + poll endpoint for Roblox) ───
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+
+  // Health check
+  if (url.pathname === "/" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(
+      JSON.stringify({
+        status: "online",
+        bot: client.user?.tag || "starting...",
+        uptime: Math.floor(process.uptime()),
+        pendingCommands: commandQueue.length,
+      })
+    );
+  }
+
+  // Poll endpoint — Roblox calls this every 5 seconds
+  if (url.pathname === "/poll" && req.method === "GET") {
+    const key = url.searchParams.get("key");
+    if (key !== POLL_SECRET) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Invalid key" }));
+    }
+
+    const since = parseInt(url.searchParams.get("since")) || 0;
+    const commands = commandQueue.filter((c) => c.id > since);
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ commands }));
+  }
+
+  // Baninfo endpoint — Roblox can report ban status back (optional)
+  if (url.pathname === "/bancheck" && req.method === "GET") {
+    const key = url.searchParams.get("key");
+    if (key !== POLL_SECRET) {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: "Invalid key" }));
+    }
+
+    const userId = url.searchParams.get("userId");
+    const ban = banCache.get(userId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ banned: !!ban, data: ban || null }));
+  }
+
+  res.writeHead(404);
+  res.end("Not found");
+});
+
+server.listen(PORT, () => {
+  console.log(`HTTP server running on port ${PORT}`);
+});
 
 // ─── Discord Bot ───
 
@@ -197,14 +184,16 @@ client.once("ready", () => {
 client.on("interactionCreate", async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // Permission check — only users with BanMembers can use moderation
+  // Permission check
   if (!interaction.member.permissions.has(PermissionFlagsBits.BanMembers)) {
     return interaction.reply({
       embeds: [
         new EmbedBuilder()
           .setColor(0xff0000)
           .setTitle("No Permission")
-          .setDescription("You need the **Ban Members** permission to use this."),
+          .setDescription(
+            "You need the **Ban Members** permission to use this."
+          ),
       ],
       ephemeral: true,
     });
@@ -231,9 +220,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    const avatar = await getAvatarUrl(player.userId);
-
-    const sent = await publishMessage({
+    queueCommand({
       action: "kick",
       userId: player.userId,
       username: player.username,
@@ -241,36 +228,22 @@ client.on("interactionCreate", async (interaction) => {
       moderator: interaction.user.tag,
     });
 
-    if (!sent) {
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xff0000)
-            .setTitle("API Error")
-            .setDescription(
-              "Failed to send kick command. Check your API key and permissions."
-            ),
-        ],
-      });
-    }
+    const avatar = await getAvatarUrl(player.userId);
 
     const embed = new EmbedBuilder()
       .setColor(0xffa500)
       .setTitle("Player Kicked")
-      .setDescription(`**${player.username}** has been kicked from all servers.`)
+      .setDescription(
+        `**${player.username}** will be kicked from all servers.`
+      )
       .addFields(
         { name: "User ID", value: `${player.userId}`, inline: true },
         { name: "Reason", value: reason, inline: true },
-        {
-          name: "Moderator",
-          value: interaction.user.tag,
-          inline: true,
-        }
+        { name: "Moderator", value: interaction.user.tag, inline: true }
       )
       .setTimestamp();
 
     if (avatar) embed.setThumbnail(avatar);
-
     return interaction.editReply({ embeds: [embed] });
   }
 
@@ -309,38 +282,25 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const banData = {
-      reason: reason,
-      duration: durationSec,
-      bannedAt: now,
-      expiresAt: durationSec === -1 ? -1 : now + durationSec,
-      moderator: interaction.user.tag,
-      username: player.username,
-    };
 
-    // Write ban to DataStore (persists even if no servers are running)
-    const stored = await writeBan(player.userId, banData);
-    if (!stored) {
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xff0000)
-            .setTitle("DataStore Error")
-            .setDescription(
-              "Failed to store ban. Check your API key has DataStore write permission."
-            ),
-        ],
-      });
-    }
-
-    // Send message to all servers to kick immediately
-    await publishMessage({
+    queueCommand({
       action: "ban",
       userId: player.userId,
       username: player.username,
       reason: reason,
       duration: durationSec,
+      bannedAt: now,
       moderator: interaction.user.tag,
+    });
+
+    // Cache ban locally for /baninfo
+    banCache.set(String(player.userId), {
+      reason,
+      duration: durationSec,
+      bannedAt: now,
+      expiresAt: durationSec === -1 ? -1 : now + durationSec,
+      moderator: interaction.user.tag,
+      username: player.username,
     });
 
     const avatar = await getAvatarUrl(player.userId);
@@ -357,11 +317,7 @@ client.on("interactionCreate", async (interaction) => {
           inline: true,
         },
         { name: "Reason", value: reason, inline: true },
-        {
-          name: "Moderator",
-          value: interaction.user.tag,
-          inline: true,
-        },
+        { name: "Moderator", value: interaction.user.tag, inline: true },
         {
           name: "Expires",
           value:
@@ -374,7 +330,6 @@ client.on("interactionCreate", async (interaction) => {
       .setTimestamp();
 
     if (avatar) embed.setThumbnail(avatar);
-
     return interaction.editReply({ embeds: [embed] });
   }
 
@@ -395,30 +350,15 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    // Check if they're actually banned
-    const existing = await readBan(player.userId);
-    if (!existing) {
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xffff00)
-            .setTitle("Not Banned")
-            .setDescription(`**${player.username}** is not currently banned.`),
-        ],
-      });
-    }
+    queueCommand({
+      action: "unban",
+      userId: player.userId,
+      username: player.username,
+      moderator: interaction.user.tag,
+    });
 
-    const deleted = await deleteBan(player.userId);
-    if (!deleted) {
-      return interaction.editReply({
-        embeds: [
-          new EmbedBuilder()
-            .setColor(0xff0000)
-            .setTitle("DataStore Error")
-            .setDescription("Failed to remove ban from DataStore."),
-        ],
-      });
-    }
+    // Remove from local cache
+    banCache.delete(String(player.userId));
 
     const avatar = await getAvatarUrl(player.userId);
 
@@ -428,16 +368,11 @@ client.on("interactionCreate", async (interaction) => {
       .setDescription(`**${player.username}** has been unbanned.`)
       .addFields(
         { name: "User ID", value: `${player.userId}`, inline: true },
-        {
-          name: "Moderator",
-          value: interaction.user.tag,
-          inline: true,
-        }
+        { name: "Moderator", value: interaction.user.tag, inline: true }
       )
       .setTimestamp();
 
     if (avatar) embed.setThumbnail(avatar);
-
     return interaction.editReply({ embeds: [embed] });
   }
 
@@ -458,7 +393,7 @@ client.on("interactionCreate", async (interaction) => {
       });
     }
 
-    const ban = await readBan(player.userId);
+    const ban = banCache.get(String(player.userId));
     const avatar = await getAvatarUrl(player.userId);
 
     if (!ban) {
@@ -470,6 +405,9 @@ client.on("interactionCreate", async (interaction) => {
           name: "User ID",
           value: `${player.userId}`,
           inline: true,
+        })
+        .setFooter({
+          text: "Note: Only tracks bans issued since bot started",
         });
       if (avatar) embed.setThumbnail(avatar);
       return interaction.editReply({ embeds: [embed] });
@@ -478,16 +416,19 @@ client.on("interactionCreate", async (interaction) => {
     // Check if expired
     const now = Math.floor(Date.now() / 1000);
     if (ban.expiresAt !== -1 && ban.expiresAt <= now) {
-      // Ban expired — clean it up
-      await deleteBan(player.userId);
+      banCache.delete(String(player.userId));
       const embed = new EmbedBuilder()
         .setColor(0x00ff00)
         .setTitle("Ban Expired")
         .setDescription(
-          `**${player.username}**'s ban has expired and been removed.`
+          `**${player.username}**'s ban has expired.`
         )
         .addFields(
-          { name: "Original Reason", value: ban.reason || "N/A", inline: true },
+          {
+            name: "Original Reason",
+            value: ban.reason || "N/A",
+            inline: true,
+          },
           {
             name: "Was Banned By",
             value: ban.moderator || "Unknown",
@@ -498,7 +439,6 @@ client.on("interactionCreate", async (interaction) => {
       return interaction.editReply({ embeds: [embed] });
     }
 
-    // Active ban
     const embed = new EmbedBuilder()
       .setColor(0xff0000)
       .setTitle("Active Ban")
@@ -523,35 +463,16 @@ client.on("interactionCreate", async (interaction) => {
         },
         {
           name: "Expires",
-          value: ban.expiresAt === -1 ? "Never" : `<t:${ban.expiresAt}:R>`,
+          value:
+            ban.expiresAt === -1 ? "Never" : `<t:${ban.expiresAt}:R>`,
           inline: true,
         }
       )
       .setTimestamp();
 
     if (avatar) embed.setThumbnail(avatar);
-
     return interaction.editReply({ embeds: [embed] });
   }
 });
-
-// ─── Keep-alive HTTP server (for free hosting on Render) ───
-const http = require("http");
-const PORT = process.env.PORT || 3000;
-
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        status: "online",
-        bot: client.user?.tag || "starting...",
-        uptime: Math.floor(process.uptime()),
-      })
-    );
-  })
-  .listen(PORT, () => {
-    console.log(`Keep-alive server running on port ${PORT}`);
-  });
 
 client.login(process.env.DISCORD_TOKEN);
